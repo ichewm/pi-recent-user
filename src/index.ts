@@ -1,8 +1,9 @@
 /**
- * pi-recent-user — 常驻 widget 显示"最近你在问什么"
+ * pi-recent-user — persistent widget showing your recent prompts.
  *
- * 配置持久化在插件自己的 ~/.pi/agent/pi-recent-user.json（不进 pi settings）。
- * /recent 调整原子写回该文件，重启保留。pi remove 后文件残留但无害。
+ * Config is persisted in the extension's own ~/.pi/agent/pi-recent-user.json
+ * (not in pi's settings.json). /recent changes are atomically written and
+ * survive restart. After `pi remove` the file remains but is harmless.
  */
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,11 +14,11 @@ const WIDGET_KEY = "pi-recent-user";
 const CONFIG_PATH = join(getAgentDir(), "pi-recent-user.json");
 
 interface RecentConfig {
-	/** 显示最近几条 user 输入（1~10） */
+	/** How many recent user prompts to show (1–10). */
 	count: number;
-	/** 每条最多显示宽度（终端列数，中英文按实际宽度算） */
+	/** Max display width per line, in terminal columns (counting CJK as 2). */
 	maxLine: number;
-	/** 是否显示 */
+	/** Whether the widget is shown. */
 	show: boolean;
 }
 
@@ -40,7 +41,7 @@ function loadConfig(): RecentConfig {
 	}
 }
 
-/** 原子写：先写 .tmp 再 rename，避免多会话并发覆盖中途丢失。 */
+/** Atomic write: write to .tmp then rename, to avoid losing data on concurrent writes. */
 function saveConfig(config: RecentConfig): void {
 	const tmp = `${CONFIG_PATH}.tmp`;
 	try {
@@ -101,14 +102,15 @@ function updateWidget(ctx: ExtensionContext, config: RecentConfig): void {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 			return;
 		}
-		const lines = ["📝 最近你在问："];
+		const lines = ["📝 Recently you asked:"];
 		msgs.forEach((m, idx) => {
 			const prefix = idx === msgs.length - 1 ? "▶" : "·";
 			lines.push(`${prefix} ${truncateToWidth(m, config.maxLine, "…")}`);
 		});
 		ctx.ui.setWidget(WIDGET_KEY, lines);
 	} catch {
-		// 任何异常（如 getBranch 失败）静默清 widget，绝不让 widget 错误影响主流程
+		// Any failure (e.g. getBranch throwing) silently clears the widget —
+		// never let the widget break the main flow.
 		try {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		} catch {
@@ -124,7 +126,7 @@ export default function recentWidget(pi: ExtensionAPI): void {
 	pi.on("turn_end", async (_e, ctx) => updateWidget(ctx, config));
 
 	pi.registerCommand("recent", {
-		description: "最近提问 widget：/recent on|off|<条数>，或无参查看状态（调整会持久化）",
+		description: "Recent-prompts widget: /recent on|off|<count>, or no args to show status (changes persist)",
 		handler: async (args, ctx) => {
 			const a = (args ?? "").trim().toLowerCase();
 			let changed = false;
@@ -132,19 +134,19 @@ export default function recentWidget(pi: ExtensionAPI): void {
 				config.show = false;
 				changed = true;
 				ctx.ui.setWidget(WIDGET_KEY, undefined);
-				if (ctx.hasUI) ctx.ui.notify("已隐藏最近提问 widget", "info");
+				if (ctx.hasUI) ctx.ui.notify("Recent widget hidden", "info");
 			} else if (a === "on" || a === "show") {
 				config.show = true;
 				changed = true;
 				updateWidget(ctx, config);
-				if (ctx.hasUI) ctx.ui.notify("已显示最近提问 widget", "info");
+				if (ctx.hasUI) ctx.ui.notify("Recent widget shown", "info");
 			} else if (/^\d+$/.test(a)) {
 				config.count = clampCount(parseInt(a, 10));
 				changed = true;
 				updateWidget(ctx, config);
-				if (ctx.hasUI) ctx.ui.notify(`显示最近 ${config.count} 条`, "info");
+				if (ctx.hasUI) ctx.ui.notify(`Showing last ${config.count} prompts`, "info");
 			} else {
-				if (ctx.hasUI) ctx.ui.notify(`最近提问：${config.show ? "显示" : "隐藏"}，共 ${config.count} 条`, "info");
+				if (ctx.hasUI) ctx.ui.notify(`Recent: ${config.show ? "shown" : "hidden"}, ${config.count} prompts`, "info");
 			}
 			if (changed) saveConfig(config);
 		},

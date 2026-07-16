@@ -1,116 +1,94 @@
 # pi-recent-user
 
-> pi 扩展：在编辑器上方常驻一个 widget，显示你**最近几轮输入的内容**。长期会话离开很久回来，不用往上翻就能接上"最近都在聊什么"。
+> A pi extension that keeps a persistent widget showing your recent prompts, so you can pick up context fast when returning to a long session.
 
-## 解决什么问题
+## Problem
 
-一个 pi 会话用久了会有很多轮对话。中途离开很久再回来时，屏幕上是 LLM 最近一轮的思考过程和回答，**往上翻半天找不到"最近这一轮我自己问了什么"**，接不上上下文。
+A pi session accumulates many turns over time. Leave for a while, come back, and the screen is full of the latest LLM thinking and answer — you scroll forever to find "what did I ask last?". This extension puts a persistent widget above the editor showing your last N prompts. One glance and you're back in context.
 
-本插件在编辑器上方放一个常驻 widget，始终显示最近 N 条 user 输入，回来一眼就接上。
-
-## 效果
-
-编辑器上方会常驻显示（示例）：
+## What it looks like
 
 ```
-📝 最近你在问：
-· 帮我看一下登录模块的 token 刷新逻辑
-· Redis 有哪些典型应用场景
-▶ 设计一个秒杀系统要考虑哪些点
+📝 Recently you asked:
+· help me review the token-refresh logic in the login module
+· what are typical Redis use cases
+▶ what to consider when designing a flash-sale system
 ```
 
-最新一条用 `▶` 标记，更早的用 `·`。
+Latest entry is marked with `▶`, earlier ones with `·`.
 
-## 安装
-
-三种方式任选：
+## Install
 
 ```bash
-# 1. 本地路径（开发/自用）
+# local path (dev/personal)
 pi install /path/to/pi-recent-user
 
-# 2. GitHub
-pi install git:github.com/<你的用户名>/pi-recent-user@v0.1.0
-# 或不锁版本：
-pi install https://github.com/<你的用户名>/pi-recent-user
+# GitHub
+pi install git:github.com/ichewm/pi-recent-user@v0.1.0
+# or unpinned
+pi install https://github.com/ichewm/pi-recent-user
 
-# 3. npm
+# npm
 pi install npm:pi-recent-user
 ```
 
-装好后**任何 pi 启动都自动加载**，不用 `-e`。卸载：`pi remove <上面用的源>`。
+Once installed, every pi start auto-loads it (no `-e` needed). Uninstall: `pi remove <source>`.
 
-> 安装/卸载不需要重启 pi 之外的操作。注意：改了 skill 等启动时加载的资源，需要 `Ctrl+D` 退出 pi 再重开（`/reload` 不重建当前会话的 system prompt）。
+## Usage
 
-## 用法
+Auto-works on install. One command to adjust:
 
-装上就自动工作，无需配置。提供一个命令调整：
-
-| 命令 | 作用 |
+| Command | Effect |
 |---|---|
-| `/recent` | 查看当前状态（显示/隐藏、条数） |
-| `/recent on` / `/recent off` | 显示 / 隐藏 widget |
-| `/recent 5` | 设置显示最近 5 条（范围 1~10） |
+| `/recent` | show current status |
+| `/recent on` / `/recent off` | show / hide the widget |
+| `/recent 5` | show last 5 prompts (range 1–10) |
 
-**所有调整都会持久化**（写入配置文件），重启 pi 后保留。
+All adjustments persist (written to the config file) and survive restart.
 
-## 配置
+## Config
 
-配置存在插件自己的文件：`~/.pi/agent/pi-recent-user.json`
+Stored in the extension's own file: `~/.pi/agent/pi-recent-user.json` — **not** in pi's `settings.json` (follows the pi ecosystem convention, so no config leftover on uninstall).
 
-**不写入 pi 的 `settings.json`**（符合 pi 生态惯例，避免安装/卸载时遗留配置）。首次运行无此文件、用默认值；`/recent` 调整后才会生成。
-
-字段：
-
-| 字段 | 类型 | 默认 | 说明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `count` | number | `3` | 显示最近几条 user 输入（1~10，超范围自动 clamp） |
-| `maxLine` | number | `70` | 每条最多显示的宽度（终端列数），超出截断加 `…`（范围 10~200） |
-| `show` | boolean | `true` | 是否显示 widget |
+| `count` | number | `3` | how many recent prompts to show (1–10, auto-clamped) |
+| `maxLine` | number | `70` | max display width per line, in terminal columns (10–200) |
+| `show` | boolean | `true` | whether the widget is shown |
 
-示例：
+To change defaults without `/recent`, edit `DEFAULTS` in `src/index.ts`.
 
-```json
-{
-  "count": 5,
-  "maxLine": 80,
-  "show": true
-}
-```
+## How it works
 
-想改默认值（不想用 `/recent` 调），直接编辑代码 `src/index.ts` 里的 `DEFAULTS` 常量。
+- **Triggers**: `session_start` (return/new session) + `turn_end` (refresh after each turn)
+- **Source**: reads `ctx.sessionManager.getBranch()`, takes the last N `role === "user"` messages
+- **Display**: `ctx.ui.setWidget()`, a persistent widget above the editor
+- **Zero side effects**: read-only — doesn't touch context, doesn't alter the message stream, makes no LLM calls
 
-## 工作原理
+## Notes
 
-- **触发时机**：`session_start`（回到会话/新建，立即显示）+ `turn_end`（每轮结束刷新）
-- **数据来源**：从 `ctx.sessionManager.getBranch()` 读取当前会话分支，取最近 N 条 `role === "user"` 的消息
-- **显示方式**：`ctx.ui.setWidget()` 常驻编辑器上方
-- **零副作用**：只读会话历史用于显示，不改 context、不改消息流、不调用 LLM
+1. **Truncation by display width** (CJK characters counted as 2 columns) via `truncateToWidth`, so wide-glyph text doesn't overflow.
+2. **Widget position**: above the editor by default. For below: pass `{ placement: "belowEditor" }` to `setWidget`.
+3. **After `pi remove`**: the config file `~/.pi/agent/pi-recent-user.json` remains but is harmless (not read when the extension is unloaded). Delete it manually to fully clean up.
+4. **Empty session**: the widget is hidden when there's no user-message history yet.
+5. **Multi-line/long input**: each entry is collapsed to a single line.
+6. **Editing the config file by hand**: restart pi to take effect — only `/recent` changes apply live.
 
-## 注意事项
+## Customize
 
-1. **按显示宽度截断**：`maxLine` 是终端列数（中英文都按实际宽度算，用 `truncateToWidth` 实现），中文不会撑宽。
-2. **widget 位置**：固定在编辑器**上方**。想放下方，给 `setWidget` 加 `{ placement: "belowEditor" }`。
-3. **`pi remove` 后**：配置文件 `~/.pi/agent/pi-recent-user.json` 会残留，但插件不加载就不读，**无害**。想彻底清理，手动删该文件。
-4. **空会话**：新会话没有 user 历史时，widget 不显示（避免占屏）。
-5. **多行/长输入**：每条压成一行（换行变空格）再截断，不会撑高 widget。
-6. **手动改配置文件**：直接编辑 `~/.pi/agent/pi-recent-user.json` 后需重启 pi 才生效（运行中不重读，只用 `/recent` 改才能实时生效）。
+Single file `src/index.ts` (~130 lines). Common tweaks:
 
-## 自定义
+- Defaults: `DEFAULTS`
+- Widget title: the `"📝 Recently you asked:"` string in `updateWidget`
+- Position below editor: add `{ placement: "belowEditor" }` to `setWidget`
+- Truncation width: `DEFAULTS.maxLine`
 
-代码就一个文件 `src/index.ts`（约 130 行），常见改动：
+After edits: `/reload` or restart pi.
 
-- 默认条数/长度：改 `DEFAULTS`
-- widget 标题文案：改 `updateWidget` 里的 `"📝 最近你在问："`
-- 位置改下方：`setWidget(key, lines, { placement: "belowEditor" })`
-- 截断宽度：改 `DEFAULTS.maxLine`
+## Dependencies
 
-改完 `/reload` 或重启 pi 生效。
-
-## 依赖
-
-- 只依赖 `@earendil-works/pi-coding-agent`（pi 自带，列在 `peerDependencies`，不用打包）
-- 无需编译，pi 用 jiti 直接跑 `.ts`
+- Runtime: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` (bundled with pi, listed as `peerDependencies`, not bundled here)
+- No build step — pi runs `.ts` directly via jiti
 
 ## License
 

@@ -2,14 +2,32 @@
   "name": "pi-recent-user",
   "version": "0.1.0",
   "type": "module",
-  "description": "pi extension: 常驻 widget 显示最近几轮你输入的内容，回到会话快速接上下文。",
+  "description": "pi extension: persistent widget showing your recent prompts, so you can resume context fast when returning to a long session.",
   "license": "MIT",
   "keywords": ["pi-package"],
+  "author": "ichewm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ichewm/pi-recent-user.git"
+  },
+  "homepage": "https://github.com/ichewm/pi-recent-user#readme",
+  "bugs": {
+    "url": "https://github.com/ichewm/pi-recent-user/issues"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
   "pi": {
     "extensions": ["./src/index.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@earendil-works/pi-tui": "^0.80.3",
+    "typebox": "*"
   }
 }
