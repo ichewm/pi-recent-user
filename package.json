@@ -17,6 +17,10 @@
   "scripts": {
     "check": "tsc --noEmit"
   },
+  "files": [
+    "src",
+    "README.md"
+  ],
   "pi": {
     "extensions": ["./src/index.ts"]
   },
