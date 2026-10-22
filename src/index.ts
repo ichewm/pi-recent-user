@@ -1,60 +1,33 @@
 /**
  * pi-recent-user — persistent widget showing your recent prompts.
  *
- * Config is persisted in the extension's own ~/.pi/agent/pi-recent-user.json
- * (not in pi's settings.json). /recent changes are atomically written and
- * survive restart. After `pi remove` the file remains but is harmless.
+ * Config UI is a local web page (config-server.ts): `/recent` opens it in
+ * your browser, edits apply instantly and persist to
+ * ~/.pi/agent/pi-recent-user.json. Quick toggles (`/recent off|on|<n>`)
+ * are still available without opening the page.
  */
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { spawn } from "node:child_process";
+import { platform } from "node:os";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	buildWidgetLines,
+	startConfigServer,
+	toSingleLine,
+	type ConfigServerHandle,
+} from "./config-server.ts";
+import {
+	clampCount,
+	CONFIG_PATH,
+	loadConfig,
+	saveConfig,
+	type RecentConfig,
+} from "./config.ts";
 
 const WIDGET_KEY = "pi-recent-user";
-const CONFIG_PATH = join(getAgentDir(), "pi-recent-user.json");
 
-interface RecentConfig {
-	/** How many recent user prompts to show (1–10). */
-	count: number;
-	/** Max display width per line, in terminal columns (counting CJK as 2). */
-	maxLine: number;
-	/** Whether the widget is shown. */
-	show: boolean;
-}
-
-const DEFAULTS: RecentConfig = { count: 3, maxLine: 70, show: true };
-
-const clampCount = (n: number): number => Math.max(1, Math.min(10, Math.floor(n)));
-const clampMaxLine = (n: number): number => Math.max(10, Math.min(200, Math.floor(n)));
-
-function loadConfig(): RecentConfig {
-	if (!existsSync(CONFIG_PATH)) return { ...DEFAULTS };
-	try {
-		const data = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-		return {
-			count: typeof data.count === "number" ? clampCount(data.count) : DEFAULTS.count,
-			maxLine: typeof data.maxLine === "number" ? clampMaxLine(data.maxLine) : DEFAULTS.maxLine,
-			show: typeof data.show === "boolean" ? data.show : DEFAULTS.show,
-		};
-	} catch {
-		return { ...DEFAULTS };
-	}
-}
-
-/** Atomic write: write to .tmp then rename, to avoid losing data on concurrent writes. */
-function saveConfig(config: RecentConfig): void {
-	const tmp = `${CONFIG_PATH}.tmp`;
-	try {
-		writeFileSync(tmp, JSON.stringify(config, null, 2), "utf-8");
-		renameSync(tmp, CONFIG_PATH);
-	} catch {
-		try {
-			unlinkSync(tmp);
-		} catch {
-			// ignore cleanup failure
-		}
-	}
-}
+/** Most recent ExtensionContext — kept fresh on every event, used to refresh the widget on web-page saves. */
+let currentCtx: ExtensionContext | null = null;
+let serverHandle: ConfigServerHandle | null = null;
 
 interface TextBlock {
 	type: "text";
@@ -83,11 +56,17 @@ function getRecentUserMessages(ctx: ExtensionContext, count: number): string[] {
 	for (let i = branch.length - 1; i >= 0 && users.length < count; i--) {
 		const e = branch[i] as BranchEntry;
 		if (e?.type === "message" && e.message?.role === "user") {
-			const text = extractUserText(e.message.content).trim();
+			const text = toSingleLine(extractUserText(e.message.content));
 			if (text) users.push(text);
 		}
 	}
 	return users.reverse();
+}
+
+/** Up to 10 recent prompts for the web page preview (count's upper bound). */
+function getSamples(): string[] {
+	if (!currentCtx) return [];
+	return getRecentUserMessages(currentCtx, 10);
 }
 
 function updateWidget(ctx: ExtensionContext, config: RecentConfig): void {
@@ -102,12 +81,8 @@ function updateWidget(ctx: ExtensionContext, config: RecentConfig): void {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 			return;
 		}
-		const lines = ["📝 Recently you asked:"];
-		msgs.forEach((m, idx) => {
-			const prefix = idx === msgs.length - 1 ? "▶" : "·";
-			lines.push(`${prefix} ${truncateToWidth(m, config.maxLine, "…")}`);
-		});
-		ctx.ui.setWidget(WIDGET_KEY, lines);
+		const lines = buildWidgetLines(config, msgs);
+		ctx.ui.setWidget(WIDGET_KEY, lines.length > 0 ? lines : undefined);
 	} catch {
 		// Any failure (e.g. getBranch throwing) silently clears the widget —
 		// never let the widget break the main flow.
@@ -119,36 +94,158 @@ function updateWidget(ctx: ExtensionContext, config: RecentConfig): void {
 	}
 }
 
+/** Open a URL in the system browser (macOS / Windows / Linux), same pattern as pi-web-access. */
+async function openInBrowser(pi: ExtensionAPI, url: string): Promise<void> {
+	const plat = platform();
+	if (plat === "darwin") {
+		const result = await pi.exec("open", [url]);
+		if (result.code !== 0) throw new Error(result.stderr || `open exited with ${result.code}`);
+		return;
+	}
+	if (plat === "win32") {
+		const result = await pi.exec("cmd", ["/c", "start", "", url]);
+		if (result.code !== 0) throw new Error(result.stderr || `start exited with ${result.code}`);
+		return;
+	}
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn("xdg-open", [url], { detached: true, stdio: "ignore" });
+		const timer = setTimeout(resolve, 100);
+		child.once("error", (err) => {
+			clearTimeout(timer);
+			reject(err);
+		});
+		child.once("exit", (code) => {
+			clearTimeout(timer);
+			if (code === 0) resolve();
+			else reject(new Error(`xdg-open exited with code ${code ?? "unknown"}`));
+		});
+		child.unref();
+	});
+}
+
+/** Ensure the config server is running; restart it if it idle-timed-out. */
+async function ensureConfigServer(config: RecentConfig): Promise<ConfigServerHandle> {
+	if (serverHandle) return serverHandle;
+	serverHandle = await startConfigServer({
+		config,
+		getSamples,
+		onSave: (c) => {
+			const persisted = saveConfig(c);
+			if (currentCtx) {
+				updateWidget(currentCtx, c);
+				if (currentCtx.hasUI)
+					currentCtx.ui.notify(
+						persisted
+							? `recent config saved (count=${c.count}, maxLine=${c.maxLine}). Hot-applied.`
+							: "recent config save FAILED (disk write error) — change applies to this session only",
+						"info",
+					);
+			}
+			return persisted;
+		},
+		onClose: () => {
+			serverHandle = null;
+		},
+	});
+	return serverHandle;
+}
+
+/** Close the config page server (if running) without waiting for idle timeout. */
+function handleClose(): void {
+	if (serverHandle) serverHandle.close();
+}
+
 export default function recentWidget(pi: ExtensionAPI): void {
 	const config = loadConfig();
 
-	pi.on("session_start", async (_e, ctx) => updateWidget(ctx, config));
-	pi.on("turn_end", async (_e, ctx) => updateWidget(ctx, config));
+	pi.on("session_start", async (_e, ctx) => {
+		currentCtx = ctx;
+		updateWidget(ctx, config);
+	});
+	pi.on("turn_end", async (_e, ctx) => {
+		currentCtx = ctx;
+		updateWidget(ctx, config);
+	});
+	pi.on("session_shutdown", async () => {
+		// release the config-page port early; a leftover server would otherwise
+		// idle for up to 10 min after /reload or session close
+		handleClose();
+	});
 
 	pi.registerCommand("recent", {
-		description: "Recent-prompts widget: /recent on|off|<count>, or no args to show status (changes persist)",
+		description: "recent-prompts widget (status|config|on|off|<count>)",
 		handler: async (args, ctx) => {
-			const a = (args ?? "").trim().toLowerCase();
-			let changed = false;
-			if (a === "off" || a === "hide") {
-				config.show = false;
-				changed = true;
-				ctx.ui.setWidget(WIDGET_KEY, undefined);
-				if (ctx.hasUI) ctx.ui.notify("Recent widget hidden", "info");
-			} else if (a === "on" || a === "show") {
-				config.show = true;
-				changed = true;
-				updateWidget(ctx, config);
-				if (ctx.hasUI) ctx.ui.notify("Recent widget shown", "info");
-			} else if (/^\d+$/.test(a)) {
-				config.count = clampCount(parseInt(a, 10));
-				changed = true;
-				updateWidget(ctx, config);
-				if (ctx.hasUI) ctx.ui.notify(`Showing last ${config.count} prompts`, "info");
-			} else {
-				if (ctx.hasUI) ctx.ui.notify(`Recent: ${config.show ? "shown" : "hidden"}, ${config.count} prompts`, "info");
+			currentCtx = ctx;
+			const [sub = "status", ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+
+			switch (sub) {
+				case "status": {
+				const lines = [
+					`widget: ${config.show ? "shown" : "hidden"} · ${config.count} prompts · maxLine ${config.maxLine}`,
+					`config: ${CONFIG_PATH}`,
+					`config page: ${serverHandle ? serverHandle.url : "/recent config to open"}`,
+					`usage: /recent config|on|off|<1-10>`,
+				];
+				ctx.ui.notify(lines.join("\n"), "info");
+				break;
+				}
+
+				case "web":
+				case "page":
+				case "config": {
+				if (rest[0] === "stop") {
+					if (serverHandle) {
+						handleClose();
+					ctx.ui.notify("config page closed", "info");
+					} else {
+						ctx.ui.notify("config page not running", "info");					}
+					break;
+				}
+				try {
+					const handle = await ensureConfigServer(config);
+					try {
+						await openInBrowser(pi, handle.url);
+					} catch (err) {
+						// browser failed to open — surface the URL so the user can open it manually
+						const msg = err instanceof Error ? err.message : String(err);
+						ctx.ui.notify(`config page (open manually):\n${handle.url}\n(${msg})`, "warning");
+						break;
+					}
+					ctx.ui.notify(`config page:\n${handle.url}\n(auto-closes after 10 min idle; /recent config stop)`, "info");
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					ctx.ui.notify(`Failed to start config page: ${msg}`, "error");
+				}
+				break;
+				}
+
+				case "off":
+				case "hide":
+					config.show = false;
+					ctx.ui.setWidget(WIDGET_KEY, undefined);
+					if (ctx.hasUI) ctx.ui.notify("Recent widget hidden", "info");
+					saveConfig(config);
+					break;
+
+				case "on":
+				case "show":
+					config.show = true;
+					updateWidget(ctx, config);
+					if (ctx.hasUI) ctx.ui.notify("Recent widget shown", "info");
+					saveConfig(config);
+					break;
+
+				default: {
+					if (/^\d+$/.test(sub)) {
+						config.count = clampCount(parseInt(sub, 10));
+					updateWidget(ctx, config);
+					if (ctx.hasUI) ctx.ui.notify(`Showing last ${config.count} prompts`, "info");
+						saveConfig(config);
+				} else {
+					ctx.ui.notify(`Unknown subcommand "${sub}". Usage: /recent status|config|on|off|<1-10>`, "warning");
+				}
+				}
 			}
-			if (changed) saveConfig(config);
 		},
 	});
 }
